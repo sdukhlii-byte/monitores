@@ -10,24 +10,24 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Конфиг из env ──────────────────────────────────────
 BOT_TOKEN        = os.environ["BOT_TOKEN"]
-CHAT_ID          = os.environ["CHAT_ID"]               # твой Telegram user ID
+CHAT_ID          = os.environ["CHAT_ID"]
 OPENAI_KEY       = os.environ.get("OPENAI_API_KEY", "")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
-OPENROUTER_KEY   = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_KEY   = os.environ.get("OPENROUTER_API_KEY", "")        # GG Group
+OPENROUTER_KEY2  = os.environ.get("OPENROUTER_API_KEY_2", "")      # Личный
+OPENROUTER_MGMT  = os.environ.get("OPENROUTER_MGMT_KEY", "")          # Management key для баланса
 RAILWAY_TOKEN    = os.environ.get("RAILWAY_API_TOKEN", "")
 RENDER_TOKEN     = os.environ.get("RENDER_API_TOKEN", "")
 
-# Пороги алертов
 OPENAI_MIN       = float(os.environ.get("OPENAI_MIN_BALANCE", "5"))
 ANTHROPIC_MIN    = float(os.environ.get("ANTHROPIC_MIN_BALANCE", "5"))
-OPENROUTER_MIN   = float(os.environ.get("OPENROUTER_MIN_BALANCE", "3"))
+OPENROUTER_MIN   = float(os.environ.get("OPENROUTER_MIN_BALANCE", "5"))
 
 bot = Bot(token=BOT_TOKEN)
 
 # ══════════════════════════════════════════════════════
-# ПРОВЕРКИ БАЛАНСОВ
+# БАЛАНСЫ
 # ══════════════════════════════════════════════════════
 
 async def check_openai() -> dict:
@@ -35,24 +35,22 @@ async def check_openai() -> dict:
         return {"name": "OpenAI", "ok": None, "msg": "ключ не задан"}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
+            # Новый endpoint через usage API
             r = await c.get(
-                "https://api.openai.com/v1/dashboard/billing/credit_grants",
+                "https://api.openai.com/v1/organization/usage/completions?start_time=1700000000",
                 headers={"Authorization": f"Bearer {OPENAI_KEY}"}
             )
         if r.status_code == 200:
-            data = r.json()
-            balance = data.get("total_available", 0)
-            ok = balance > OPENAI_MIN
-            return {"name": "OpenAI", "ok": ok, "balance": f"${balance:.2f}", "threshold": f"${OPENAI_MIN}"}
-        # Fallback: subscription endpoint
+            return {"name": "OpenAI", "ok": True, "balance": "ключ активен (баланс через dashboard)"}
+        # Fallback — просто проверяем что ключ валидный
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(
-                "https://api.openai.com/v1/dashboard/billing/subscription",
+                "https://api.openai.com/v1/models",
                 headers={"Authorization": f"Bearer {OPENAI_KEY}"}
             )
         if r.status_code == 200:
-            return {"name": "OpenAI", "ok": True, "balance": "API доступен (баланс скрыт)", "threshold": "—"}
-        return {"name": "OpenAI", "ok": False, "msg": f"HTTP {r.status_code}"}
+            return {"name": "OpenAI", "ok": True, "balance": "ключ активен"}
+        return {"name": "OpenAI", "ok": False, "msg": f"HTTP {r.status_code} — ключ не работает"}
     except Exception as e:
         return {"name": "OpenAI", "ok": False, "msg": str(e)}
 
@@ -62,50 +60,78 @@ async def check_anthropic() -> dict:
         return {"name": "Anthropic", "ok": None, "msg": "ключ не задан"}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(
-                "https://api.anthropic.com/v1/organizations/usage",
+            r = await c.post(
+                "https://api.anthropic.com/v1/messages",
                 headers={
                     "x-api-key": ANTHROPIC_KEY,
-                    "anthropic-version": "2023-06-01"
-                }
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
             )
-        if r.status_code in (200, 404):
-            # Нет публичного баланс-endpoint — проверяем доступность ключа
-            return {"name": "Anthropic", "ok": True, "balance": "ключ активен", "threshold": "—"}
+        # 200 = ок, 400 = ок (ключ валиден), 401 = невалидный ключ
+        if r.status_code in (200, 400):
+            return {"name": "Anthropic", "ok": True, "balance": "ключ активен"}
         return {"name": "Anthropic", "ok": False, "msg": f"HTTP {r.status_code}"}
     except Exception as e:
         return {"name": "Anthropic", "ok": False, "msg": str(e)}
 
 
-async def check_openrouter() -> dict:
-    if not OPENROUTER_KEY:
-        return {"name": "OpenRouter", "ok": None, "msg": "ключ не задан"}
+async def _openrouter_balance(mgmt_key: str) -> dict:
+    """Получает реальный баланс через Management Key."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                "https://openrouter.ai/api/v1/credits",
+                headers={"Authorization": f"Bearer {mgmt_key}"}
+            )
+        if r.status_code != 200:
+            return {"ok": False, "msg": f"credits API HTTP {r.status_code}"}
+        data = r.json().get("data", r.json())
+        total   = float(data.get("total_credits", 0) or 0)
+        used    = float(data.get("total_usage", 0) or 0)
+        balance = total - used
+        ok = balance > OPENROUTER_MIN
+        return {"ok": ok, "balance": f"${balance:.2f} осталось (потрачено ${used:.2f} из ${total:.2f})", "threshold": f"${OPENROUTER_MIN}"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+
+async def _check_openrouter_key(key: str, label: str) -> dict:
+    """Проверяет один OpenRouter ключ — валидность + usage."""
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(
                 "https://openrouter.ai/api/v1/auth/key",
-                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"}
+                headers={"Authorization": f"Bearer {key}"}
             )
-        if r.status_code == 200:
-            data = r.json().get("data", {})
-            limit      = data.get("limit")         # None = unlimited
-            usage      = data.get("usage", 0)
-            limit_remaining = data.get("limit_remaining")
-            if limit is None:
-                balance_str = f"unlimited (использовано ${usage:.4f})"
-                ok = True
-            else:
-                remaining = limit_remaining or (limit - usage)
-                ok = remaining > OPENROUTER_MIN
-                balance_str = f"${remaining:.4f} осталось"
-            return {"name": "OpenRouter", "ok": ok, "balance": balance_str, "threshold": f"${OPENROUTER_MIN}"}
-        return {"name": "OpenRouter", "ok": False, "msg": f"HTTP {r.status_code}"}
+        if r.status_code != 200:
+            return {"name": f"OpenRouter ({label})", "ok": False, "msg": f"HTTP {r.status_code}"}
+        data  = r.json().get("data", {})
+        usage = float(data.get("usage", 0) or 0)
+        return {"name": f"OpenRouter ({label})", "ok": True, "balance": f"ключ активен, использовано ${usage:.2f}"}
     except Exception as e:
-        return {"name": "OpenRouter", "ok": False, "msg": str(e)}
+        return {"name": f"OpenRouter ({label})", "ok": False, "msg": str(e)}
+
+
+async def check_openrouter() -> list[dict]:
+    results = []
+    # Если есть management key — показываем реальный баланс аккаунта
+    if OPENROUTER_MGMT:
+        b = await _openrouter_balance(OPENROUTER_MGMT)
+        results.append({"name": "OpenRouter (баланс аккаунта)", **b})
+    # Проверяем валидность ключей
+    if OPENROUTER_KEY:
+        results.append(await _check_openrouter_key(OPENROUTER_KEY, "GG Group"))
+    if OPENROUTER_KEY2:
+        results.append(await _check_openrouter_key(OPENROUTER_KEY2, "Личный"))
+    if not results:
+        results.append({"name": "OpenRouter", "ok": None, "msg": "ключи не заданы"})
+    return results
 
 
 # ══════════════════════════════════════════════════════
-# ПРОВЕРКИ ДЕПЛОЕВ
+# ДЕПЛОИ
 # ══════════════════════════════════════════════════════
 
 RAILWAY_GQL = "https://backboard.railway.app/graphql/v2"
@@ -126,10 +152,7 @@ async def check_railway() -> list[dict]:
                     name
                     deployments(last: 1) {
                       edges {
-                        node {
-                          status
-                          createdAt
-                        }
+                        node { status createdAt }
                       }
                     }
                   }
@@ -150,26 +173,22 @@ async def check_railway() -> list[dict]:
             )
         if r.status_code != 200:
             return [{"name": "Railway", "ok": False, "msg": f"HTTP {r.status_code}"}]
-        data = r.json()
         results = []
-        for proj_edge in data["data"]["me"]["projects"]["edges"]:
+        for proj_edge in r.json()["data"]["me"]["projects"]["edges"]:
             proj = proj_edge["node"]
-            proj_name = proj["name"]
             for svc_edge in proj["services"]["edges"]:
                 svc = svc_edge["node"]
-                svc_name = svc["name"]
                 deploys = svc["deployments"]["edges"]
                 if not deploys:
-                    results.append({"name": f"{proj_name} / {svc_name}", "ok": None, "msg": "нет деплоев"})
                     continue
                 status = deploys[0]["node"]["status"]
                 ok = status == "SUCCESS"
                 results.append({
-                    "name": f"{proj_name} / {svc_name}",
+                    "name": f"{proj['name']} / {svc['name']}",
                     "ok": ok,
                     "status": status
                 })
-        return results
+        return results or [{"name": "Railway", "ok": None, "msg": "нет сервисов"}]
     except Exception as e:
         return [{"name": "Railway", "ok": False, "msg": str(e)}]
 
@@ -185,44 +204,43 @@ async def check_render() -> list[dict]:
             )
         if r.status_code != 200:
             return [{"name": "Render", "ok": False, "msg": f"HTTP {r.status_code}"}]
-        services = r.json()
         results = []
-        for item in services:
-            svc = item.get("service", item)
-            name   = svc.get("name", "?")
-            state  = svc.get("suspended", "not_suspended")
-            deploy = svc.get("deployInfo", {})
-            d_status = deploy.get("buildStatus") or deploy.get("status") or "unknown"
-            ok = state == "not_suspended" and d_status in ("live", "build_in_progress", "update_in_progress", "unknown")
-            results.append({"name": f"Render / {name}", "ok": ok, "status": d_status, "suspended": state})
+        for item in r.json():
+            svc      = item.get("service", item)
+            name     = svc.get("name", "?")
+            suspended = svc.get("suspended", "not_suspended")
+            ok       = suspended == "not_suspended"
+            results.append({
+                "name": f"Render / {name}",
+                "ok": ok,
+                "status": "active" if ok else "suspended"
+            })
         return results
     except Exception as e:
         return [{"name": "Render", "ok": False, "msg": str(e)}]
 
 
 # ══════════════════════════════════════════════════════
-# ФОРМАТИРОВАНИЕ СООБЩЕНИЙ
+# ФОРМАТИРОВАНИЕ
 # ══════════════════════════════════════════════════════
 
-def status_icon(ok):
+def icon(ok):
     if ok is True:  return "✅"
     if ok is False: return "🔴"
     return "⚪"
 
 def fmt_balance(r: dict) -> str:
-    icon = status_icon(r["ok"])
-    name = r["name"]
+    i = icon(r["ok"])
     if "balance" in r:
-        thresh = f" (порог: {r['threshold']})" if r.get("threshold", "—") != "—" else ""
-        return f"{icon} *{name}*: {r['balance']}{thresh}"
-    return f"{icon} *{name}*: {r.get('msg', '?')}"
+        thresh = f" (порог {r['threshold']})" if r.get("threshold") else ""
+        return f"{i} *{r['name']}*: {r['balance']}{thresh}"
+    return f"{i} *{r['name']}*: {r.get('msg', '?')}"
 
 def fmt_deploy(r: dict) -> str:
-    icon = status_icon(r["ok"])
-    name = r["name"]
+    i = icon(r["ok"])
     if "status" in r:
-        return f"{icon} {name}: `{r['status']}`"
-    return f"{icon} {name}: {r.get('msg', '?')}"
+        return f"{i} {r['name']}: `{r['status']}`"
+    return f"{i} {r['name']}: {r.get('msg', '?')}"
 
 async def build_digest(balances, deploys_rw, deploys_rd) -> str:
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -240,7 +258,6 @@ async def build_digest(balances, deploys_rw, deploys_rd) -> str:
     for d in deploys_rd:
         lines.append(fmt_deploy(d))
 
-    # Итог
     all_checks = balances + deploys_rw + deploys_rd
     failed = [x for x in all_checks if x["ok"] is False]
     if failed:
@@ -252,16 +269,17 @@ async def build_digest(balances, deploys_rw, deploys_rd) -> str:
 
 
 # ══════════════════════════════════════════════════════
-# ЗАДАЧИ ПЛАНИРОВЩИКА
+# ПЛАНИРОВЩИК
 # ══════════════════════════════════════════════════════
 
-_last_failed: set = set()   # для дедупликации алертов
+_last_failed: set = set()
 
 async def run_all_checks():
-    balances  = await asyncio.gather(check_openai(), check_anthropic(), check_openrouter())
+    openrouter_results = await check_openrouter()
+    balances = list(await asyncio.gather(check_openai(), check_anthropic())) + openrouter_results
     deploys_rw = await check_railway()
     deploys_rd = await check_render()
-    return list(balances), deploys_rw, deploys_rd
+    return balances, deploys_rw, deploys_rd
 
 async def morning_digest():
     log.info("Running morning digest")
@@ -274,18 +292,14 @@ async def morning_digest():
         await bot.send_message(chat_id=CHAT_ID, text=f"❌ Ошибка дайджеста: {e}")
 
 async def alert_check():
-    """Каждые 30 мин — только алерты если что упало"""
     global _last_failed
     log.info("Running alert check")
     try:
         balances, deploys_rw, deploys_rd = await run_all_checks()
-        all_checks = list(balances) + deploys_rw + deploys_rd
+        all_checks = balances + deploys_rw + deploys_rd
         failed_now = {x["name"] for x in all_checks if x["ok"] is False}
-
-        # Новые падения (которых раньше не было)
         new_failures = failed_now - _last_failed
-        # Восстановления
-        recovered = _last_failed - failed_now
+        recovered    = _last_failed - failed_now
 
         if new_failures:
             lines = ["🚨 *АЛЕРТ — что-то упало!*\n"]
@@ -295,9 +309,7 @@ async def alert_check():
             await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
         if recovered:
-            lines = ["✅ *Восстановлено*\n"]
-            for name in recovered:
-                lines.append(f"✅ {name}")
+            lines = ["✅ *Восстановлено*\n"] + [f"✅ {n}" for n in recovered]
             await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
         _last_failed = failed_now
@@ -305,27 +317,19 @@ async def alert_check():
         log.error(f"Alert check error: {e}")
 
 
-# ══════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════
-
 async def main():
     log.info("Monitor bot starting...")
-
-    # Проверяем что бот работает
     me = await bot.get_me()
     log.info(f"Bot: @{me.username}")
-    await bot.send_message(chat_id=CHAT_ID, text=f"🤖 Монитор запущен (@{me.username})\nПервый дайджест придёт в 9:00")
+    await bot.send_message(chat_id=CHAT_ID, text=f"🤖 Монитор запущен (@{me.username})\nДайджест в 9:00 по Madrid")
 
     scheduler = AsyncIOScheduler(timezone="Europe/Madrid")
     scheduler.add_job(morning_digest, "cron", hour=9, minute=0)
     scheduler.add_job(alert_check,   "interval", minutes=30)
     scheduler.start()
 
-    # Сразу запускаем проверку при старте
     await morning_digest()
 
-    # Держим процесс живым
     while True:
         await asyncio.sleep(3600)
 
