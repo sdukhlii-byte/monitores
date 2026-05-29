@@ -174,6 +174,7 @@ async def _check_railway_token(token: str, label: str) -> list[dict]:
         if r.status_code != 200:
             return [{"name": f"Railway ({label})", "ok": False, "msg": f"HTTP {r.status_code}"}]
         data = r.json()
+        log.info(f"Railway ({label}) response: {data}")
         projects = (data.get("data") or {}).get("me", {}).get("projects", {}).get("edges", [])
         results = []
         for proj_edge in projects:
