@@ -18,6 +18,7 @@ OPENROUTER_KEY   = os.environ.get("OPENROUTER_API_KEY", "")        # GG Group
 OPENROUTER_KEY2  = os.environ.get("OPENROUTER_API_KEY_2", "")      # Личный
 OPENROUTER_MGMT  = os.environ.get("OPENROUTER_MGMT_KEY", "")          # Management key для баланса
 RAILWAY_TOKEN    = os.environ.get("RAILWAY_API_TOKEN", "")
+RAILWAY_TOKEN_2  = os.environ.get("RAILWAY_API_TOKEN_2", "")
 RENDER_TOKEN     = os.environ.get("RENDER_API_TOKEN", "")
 
 OPENAI_MIN       = float(os.environ.get("OPENAI_MIN_BALANCE", "5"))
@@ -136,25 +137,20 @@ async def check_openrouter() -> list[dict]:
 
 RAILWAY_GQL = "https://backboard.railway.app/graphql/v2"
 
-async def check_railway() -> list[dict]:
-    if not RAILWAY_TOKEN:
-        return [{"name": "Railway", "ok": None, "msg": "токен не задан"}]
-    query = """
-    query {
-      me {
-        projects {
-          edges {
-            node {
-              name
-              services {
-                edges {
-                  node {
-                    name
-                    deployments(last: 1) {
-                      edges {
-                        node { status createdAt }
-                      }
-                    }
+RAILWAY_QUERY = """
+query {
+  me {
+    projects {
+      edges {
+        node {
+          name
+          services {
+            edges {
+              node {
+                name
+                deployments(last: 1) {
+                  edges {
+                    node { status createdAt }
                   }
                 }
               }
@@ -163,34 +159,53 @@ async def check_railway() -> list[dict]:
         }
       }
     }
-    """
+  }
+}
+"""
+
+async def _check_railway_token(token: str, label: str) -> list[dict]:
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.post(
                 RAILWAY_GQL,
-                json={"query": query},
-                headers={"Authorization": f"Bearer {RAILWAY_TOKEN}"}
+                json={"query": RAILWAY_QUERY},
+                headers={"Authorization": f"Bearer {token}"}
             )
         if r.status_code != 200:
-            return [{"name": "Railway", "ok": False, "msg": f"HTTP {r.status_code}"}]
+            return [{"name": f"Railway ({label})", "ok": False, "msg": f"HTTP {r.status_code}"}]
+        data = r.json()
+        projects = (data.get("data") or {}).get("me", {}).get("projects", {}).get("edges", [])
         results = []
-        for proj_edge in r.json()["data"]["me"]["projects"]["edges"]:
-            proj = proj_edge["node"]
-            for svc_edge in proj["services"]["edges"]:
-                svc = svc_edge["node"]
-                deploys = svc["deployments"]["edges"]
+        for proj_edge in projects:
+            proj = proj_edge.get("node") or {}
+            proj_name = proj.get("name", "?")
+            for svc_edge in proj.get("services", {}).get("edges", []):
+                svc = svc_edge.get("node") or {}
+                svc_name = svc.get("name", "?")
+                if svc_name.lower() in ("redis", "postgres", "postgresql"):
+                    continue
+                deploys = svc.get("deployments", {}).get("edges", [])
                 if not deploys:
                     continue
-                status = deploys[0]["node"]["status"]
+                status = (deploys[0].get("node") or {}).get("status", "UNKNOWN")
                 ok = status == "SUCCESS"
                 results.append({
-                    "name": f"{proj['name']} / {svc['name']}",
+                    "name": f"{proj_name} / {svc_name}",
                     "ok": ok,
                     "status": status
                 })
-        return results or [{"name": "Railway", "ok": None, "msg": "нет сервисов"}]
+        return results
     except Exception as e:
-        return [{"name": "Railway", "ok": False, "msg": str(e)}]
+        return [{"name": f"Railway ({label})", "ok": False, "msg": str(e)}]
+
+
+async def check_railway() -> list[dict]:
+    results = []
+    if RAILWAY_TOKEN:
+        results += await _check_railway_token(RAILWAY_TOKEN, "sdukhlii")
+    if RAILWAY_TOKEN_2:
+        results += await _check_railway_token(RAILWAY_TOKEN_2, "GG Group")
+    return results or [{"name": "Railway", "ok": None, "msg": "токены не заданы"}]
 
 
 async def check_render() -> list[dict]:
